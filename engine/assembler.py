@@ -86,26 +86,44 @@ class ContextAssembler:
         edges = graph.get_causal_chain(cid, max_hops=2, min_confidence=0.3)
         causal_chain = [edge.to_output(resolver) for edge in edges]
 
-        # 4. Similar incidents — from motif index
+        # 4. Root cause analysis — find origins of the incident
+        root_causes = graph._find_root_causes(cid, max_hops=3, min_confidence=0.25)
+
+        # 5. Similar incidents — from motif index
         current_motif = graph.extract_motif(edges)
         current_motif.timestamp = anchor_ts
-        matches = motif_index.find_similar(current_motif, top_k=5)
+        # Anchor the query motif to the target service's canonical_id
+        # This is the primary family discriminator across renames
+        if cid not in current_motif.canonical_ids:
+            current_motif.canonical_ids.append(cid)
+        matches = motif_index.find_similar(current_motif, top_k=10)
+        matches = _filter_similar_matches(matches)[:5]
 
-        # 5. Suggested remediations
+        # 6. Suggested remediations
         remediations = _build_remediations(matches, graph, cid, resolver)
 
-        # 6. Confidence
-        confidence = (
+        # 7. Confidence — now informed by root cause analysis strength
+        base_confidence = (
             sum(e.confidence for e in edges) / len(edges)
             if edges else 0.0
         )
+        # Boost confidence if we found strong root causes
+        root_cause_boost = 0.0
+        if root_causes:
+            # Average confidence of top root causes
+            top_roots = root_causes[:2]
+            root_cause_boost = (
+                sum(rc.get("confidence", 0) for rc in top_roots) / len(top_roots) * 0.15
+            )
+        confidence = min(0.99, base_confidence + root_cause_boost)
 
-        # 7. Explain
+        # 8. Explain (enhanced with root cause analysis)
         if mode == "deep":
             explain = _llm_explain(
                 service=resolver.current_name(cid),
                 related=related,
                 causal_chain=causal_chain,
+                root_causes=root_causes,
                 matches=matches,
                 remediations=remediations,
                 resolver=resolver,
@@ -116,6 +134,7 @@ class ContextAssembler:
                 cid=cid,
                 related=related,
                 causal_chain=causal_chain,
+                root_causes=root_causes,
                 matches=matches,
                 remediations=remediations,
                 resolver=resolver,
@@ -126,6 +145,19 @@ class ContextAssembler:
         return {
             "related_events": related,
             "causal_chain": causal_chain,
+            "root_cause_candidates": [
+                {
+                    "canonical_id": rc["cid"],
+                    "service_name": resolver.current_name(rc["cid"]),
+                    "confidence": rc["confidence"],
+                    "evidence_count": rc["evidence_count"],
+                    "path_length": rc["path_length"],
+                    "causal_chain": [
+                        resolver.current_name(c) for c in rc["causal_chain"]
+                    ],
+                }
+                for rc in root_causes[:3]  # Top 3 root causes
+            ],
             "similar_past_incidents": [
                 {
                     # Both field names — spec uses past_incident_id, harness may use incident_id
@@ -148,6 +180,20 @@ class ContextAssembler:
 # ------------------------------------------------------------------
 # Helpers
 # ------------------------------------------------------------------
+
+def _filter_similar_matches(
+    matches: list[IncidentMatch],
+    threshold: float = 0.45,
+    min_count: int = 3,
+) -> list[IncidentMatch]:
+    """Post-retrieval confidence filter; fallback preserves recall when too few pass."""
+    if not matches:
+        return matches
+    filtered = [m for m in matches if m.similarity >= threshold]
+    if len(filtered) < min_count:
+        return matches
+    return filtered
+
 
 def _dedupe(events: list[dict]) -> list[dict]:
     """Deduplicate events by event_id. Preserves order."""
@@ -216,6 +262,7 @@ def _template_explain(
     cid: str,
     related: list[dict],
     causal_chain: list[dict],
+    root_causes: list[dict],
     matches: list[IncidentMatch],
     remediations: list[dict],
     resolver: IdentityResolver,
@@ -226,6 +273,7 @@ def _template_explain(
     Template-based explain string for fast mode.
     No LLM — pure string formatting.
     Targets 4/5 judge score by including all required elements.
+    NOW INCLUDES ROOT CAUSE ANALYSIS NARRATIVE.
     """
     lines: list[str] = []
 
@@ -236,7 +284,23 @@ def _template_explain(
         f"{event_count} related event{'s' if event_count != 1 else ''} found in the 5-minute window."
     )
 
-    # 2. Causal chain narrative
+    # 2. Root cause analysis
+    if root_causes:
+        top_root = root_causes[0]
+        root_cid = top_root.get("cid", "?")
+        root_name = resolver.current_name(root_cid)
+        root_conf = top_root.get("confidence", 0)
+        path_len = top_root.get("path_length", 0)
+        evidence = top_root.get("evidence_count", 0)
+        lines.append(
+            f"ROOT CAUSE IDENTIFIED: {root_name} (confidence {root_conf:.0%}, "
+            f"supported by {evidence} evidence events, "
+            f"{path_len} hop{'s' if path_len != 1 else ''} to incident)."
+        )
+    else:
+        lines.append("Root cause analysis in progress — insufficient causal evidence yet.")
+
+    # 3. Causal chain narrative
     if causal_chain:
         chain_parts = []
         for edge in causal_chain[:3]:  # Top 3 edges
@@ -249,7 +313,7 @@ def _template_explain(
     else:
         lines.append("No established causal chain found for this entity yet.")
 
-    # 3. Deployment context
+    # 4. Deployment context
     recent_deploy = graph.get_recent_deploy(cid, anchor_ts, window_s=600)
     if recent_deploy:
         version = recent_deploy.get("version", "unknown")
@@ -259,7 +323,7 @@ def _template_explain(
             f"which may be the triggering change."
         )
 
-    # 4. Historical precedent
+    # 5. Historical precedent
     if matches:
         best = matches[0]
         # Resolve canonical_ids in the match to current names
@@ -273,7 +337,7 @@ def _template_explain(
     else:
         lines.append("No similar past incidents found in the behavioral motif index.")
 
-    # 5. Suggested remediation
+    # 6. Suggested remediation
     if remediations:
         top = remediations[0]
         lines.append(
@@ -291,6 +355,7 @@ def _llm_explain(
     service: str,
     related: list[dict],
     causal_chain: list[dict],
+    root_causes: list[dict],
     matches: list[IncidentMatch],
     remediations: list[dict],
     resolver: IdentityResolver,
@@ -300,7 +365,7 @@ def _llm_explain(
     Falls back to template if LLM is unavailable.
     """
     try:
-        return _call_llm(service, related, causal_chain, matches, remediations, resolver)
+        return _call_llm(service, related, causal_chain, root_causes, matches, remediations, resolver)
     except Exception as e:
         # Graceful fallback to template
         return (
@@ -310,6 +375,7 @@ def _llm_explain(
                 cid="",
                 related=related,
                 causal_chain=causal_chain,
+                root_causes=root_causes,
                 matches=matches,
                 remediations=remediations,
                 resolver=resolver,
@@ -323,6 +389,7 @@ def _call_llm(
     service: str,
     related: list[dict],
     causal_chain: list[dict],
+    root_causes: list[dict],
     matches: list[IncidentMatch],
     remediations: list[dict],
     resolver: IdentityResolver,
@@ -330,6 +397,7 @@ def _call_llm(
     """
     Single LLM call for deep mode explain.
     Supports OpenAI and Anthropic via environment variables.
+    NOW INCLUDES ROOT CAUSE ANALYSIS IN PROMPT.
     """
     import json as _json
 
@@ -338,6 +406,16 @@ def _call_llm(
         f"{e.get('cause_name','?')} → {e.get('effect_name','?')} ({e.get('relation','')})"
         for e in causal_chain[:4]
     ) or "none"
+
+    # ROOT CAUSE SUMMARY
+    root_cause_summary = "none"
+    if root_causes:
+        root_cause_summary = "; ".join(
+            f"{resolver.current_name(rc['cid'])} (confidence={rc.get('confidence', 0.0):.0%}, "
+            f"evidence={rc.get('evidence_count', 0)}, "
+            f"{rc.get('path_length', 0)} hops)"
+            for rc in root_causes[:2]
+        )
 
     past_summary = "; ".join(
         f"{m.incident_id} (sim={m.similarity:.0%}, action={m.remediation_action})"
@@ -355,6 +433,7 @@ def _call_llm(
 
 Service: {service}
 Related event types: {', '.join(event_kinds)}
+Root causes: {root_cause_summary}
 Causal chain: {chain_summary}
 Similar past incidents: {past_summary}
 Suggested remediations: {remediation_summary}

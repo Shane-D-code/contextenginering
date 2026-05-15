@@ -5,9 +5,9 @@
     {
       "name": "1. Ingest throughput",
       "passed": true,
-      "value": "1264 ev/s",
+      "value": "1596 ev/s",
       "threshold": ">= 1,000 ev/s",
-      "detail": "Ingested 1000 events in 0.791s"
+      "detail": "Ingested 1000 events in 0.627s"
     },
     {
       "name": "2. Output schema validation",
@@ -26,14 +26,14 @@
     {
       "name": "4. Temporal ordering (cause_ts < effect_ts)",
       "passed": true,
-      "value": "0 violations in 1 edges",
+      "value": "0 violations in 4 edges",
       "threshold": "0 violations",
       "detail": ""
     },
     {
       "name": "5. Fast mode p95 latency",
       "passed": true,
-      "value": "p95=3ms  p50=1ms  (20 calls)",
+      "value": "p95=1ms  p50=1ms  (20 calls)",
       "threshold": "<= 2,000ms",
       "detail": ""
     },
@@ -47,14 +47,14 @@
     {
       "name": "7. Suggested remediations",
       "passed": true,
-      "value": "1 suggestions  top=rollback  conf=0.85",
+      "value": "1 suggestions  top=rollback  conf=0.90",
       "threshold": "Non-empty with action field",
       "detail": ""
     },
     {
       "name": "8. Memory evolution",
       "passed": true,
-      "value": "motifs 0->1  confidence 0.45->0.45",
+      "value": "motifs 0->1  confidence 0.37->0.43",
       "threshold": "Motif count grows after resolved remediation",
       "detail": ""
     },
@@ -68,14 +68,14 @@
     {
       "name": "10. Multi-family discrimination",
       "passed": true,
-      "value": "top=inc-fam0-0  sim=0.85  indexed=6",
+      "value": "top=inc-fam0-0  sim=0.90  indexed=6",
       "threshold": "Family-0 query returns family-0 as top match",
-      "detail": "top3=[('inc-fam0-0', 0.85), ('inc-fam1-1', 0.85), ('inc-fam0-99', 0.85)]"
+      "detail": "top3=[('inc-fam0-0', 0.9), ('inc-fam0-99', 0.9), ('inc-fam1-1', 0.4)]"
     },
     {
       "name": "11. Deep mode (valid Context, p95<=6s)",
       "passed": true,
-      "value": "2ms  explain_len=559",
+      "value": "1ms  explain_len=899",
       "threshold": "Non-empty explain, <= 6,000ms",
       "detail": ""
     }

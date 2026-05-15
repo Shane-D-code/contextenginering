@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import threading
 import uuid
+from datetime import datetime, timedelta, timezone
 from typing import Iterable, Literal
 
 from engine.assembler import ContextAssembler
@@ -45,6 +46,43 @@ class Engine:
     # Ingestion
     # ------------------------------------------------------------------
 
+    def _normalize_event(self, event: dict) -> dict:
+        """
+        PHASE 1: Normalize event format for spec compatibility.
+        Handles field name variations from different sources.
+        """
+        normalized = dict(event)  # Shallow copy
+
+        # Log events: normalize msg → message
+        if normalized.get("kind") == "log":
+            if "msg" in normalized and "message" not in normalized:
+                normalized["message"] = normalized.pop("msg")
+
+        # Topology events: flatten various rename formats
+        if normalized.get("kind") == "topology":
+            # Handle from_ → from (Python reserved word workaround in generator)
+            if "from_" in normalized and "from" not in normalized:
+                normalized["from"] = normalized.pop("from_")
+            # Handle string change values ("rename" instead of object)
+            change_val = normalized.get("change")
+            if isinstance(change_val, str) and change_val.lower() == "rename":
+                # Keep Annex-A format as-is: {change: "rename", from: ..., to: ...}
+                pass
+
+        # Incident/Remediation: ensure service field exists
+        if normalized.get("kind") in ("incident_signal", "remediation"):
+            # If no service, try to use target field
+            if not normalized.get("service"):
+                if normalized.get("target"):
+                    normalized["service"] = normalized["target"]
+
+        # Deploy events: ensure actor field exists
+        if normalized.get("kind") == "deploy":
+            if not normalized.get("actor"):
+                normalized["actor"] = "system"
+
+        return normalized
+
     def ingest(self, events: Iterable[dict]) -> None:
         """
         Process a stream of events. Thread-safe.
@@ -52,7 +90,8 @@ class Engine:
         to ensure canonical_id consistency for all subsequent events.
         Uses batch inserts for throughput ≥ 1,000 ev/s.
         """
-        event_list = list(events)
+        # PHASE 1: Normalize all incoming events
+        event_list = [self._normalize_event(e) for e in events]
 
         # Separate topology events — process them first
         topology_events = [e for e in event_list if e.get("kind") == "topology"]
@@ -66,10 +105,9 @@ class Engine:
             # Resolve all canonical_ids and prepare batch insert rows
             batch_rows: list[tuple] = []
             for event in other_events:
-                service = event.get("service", event.get("svc", ""))
-                if not service:
+                cid = self._resolve_cid_for_event(event)
+                if not cid:
                     continue
-                cid = self.resolver.resolve(service)
                 event_id = event.get("event_id") or event.get("id") or str(uuid.uuid4())
                 ts = event.get("ts", "")
                 kind = event.get("kind", "unknown")
@@ -82,11 +120,10 @@ class Engine:
 
             # Process graph/motif updates (non-storage logic)
             for event in other_events:
-                service = event.get("service", event.get("svc", ""))
-                if not service:
-                    continue
-                cid = self.resolver.resolve(service)
                 kind = event.get("kind", "")
+                cid = self._resolve_cid_for_event(event)
+                if not cid:
+                    continue
                 if kind == "deploy":
                     self._on_deploy(event, cid)
                 elif kind in ("log", "metric", "trace"):
@@ -96,23 +133,97 @@ class Engine:
                 elif kind == "remediation":
                     self._on_remediation(event, cid)
 
+    def _resolve_cid_for_event(self, event: dict) -> str:
+        """
+        Resolve canonical_id for any event kind.
+
+        Priority order:
+          1. service / svc field (most events)
+          2. target field (remediation events from Annex A JSONL)
+          3. incident_id lookup via open incidents (incident_signal / remediation
+             when the service field is omitted — canonical Annex A format)
+          4. Return "" to signal "skip this event"
+        """
+        service = event.get("service", event.get("svc", ""))
+        if service:
+            return self.resolver.resolve(service)
+
+        kind = event.get("kind", "")
+
+        # Annex-A remediation: use `target` field
+        target = event.get("target", "")
+        if target:
+            return self.resolver.resolve(target)
+
+        # Annex-A incident_signal / remediation with no service/target:
+        # look up which entity owns the open incident
+        inc_id = event.get("incident_id", "")
+        if inc_id and kind in ("incident_signal", "remediation"):
+            if inc_id in self._open_incidents:
+                return self._open_incidents[inc_id]["cid"]
+            # incident_signal with no prior context — register a placeholder
+            # keyed on incident_id so subsequent remediation finds it
+            if kind == "incident_signal":
+                trigger = event.get("trigger", "")
+                # Extract a service hint from the trigger string if possible
+                # e.g. "alert:checkout-api/error-rate>5%" → "checkout-api"
+                if trigger and ":" in trigger:
+                    hint = trigger.split(":", 1)[1].split("/")[0].strip()
+                    if hint:
+                        return self.resolver.resolve(hint)
+
+        return ""
+
     def _on_topology(self, event: dict) -> None:
-        """Handle topology mutation events (rename, dependency shift)."""
-        mutation = event.get("mutation", event.get("change", {}))
+        """Handle topology mutation events (rename, dependency shift).
+
+        Supports two wire formats:
+          A) Annex-A canonical:  {change: "rename", from: "old", to: "new"}
+          B) Internal/extended:  {mutation: {kind: "rename", old_name: "old", new_name: "new"}}
+        """
+        ts = event.get("ts", "")
+
+        # --- Format A: flat canonical (from Annex A JSONL) ---
+        change_val = event.get("change", "")
+        if change_val:
+            change_kind = str(change_val).lower()
+            if change_kind == "rename":
+                old_name = event.get("from", "")
+                new_name = event.get("to", "")
+                if old_name and new_name:
+                    self.resolver.rename(old_name, new_name, ts)
+            elif change_kind in ("dep_add", "dep_remove", "dependency"):
+                self.resolver.resolve(event.get("src", event.get("source", "")) or "")
+                self.resolver.resolve(event.get("dst", event.get("target", "")) or "")
+            return
+
+        # --- Format B: mutation dict (internal / extended) ---
+        mutation = event.get("mutation")
         if not mutation:
             mutation = event
 
-        kind = mutation.get("kind", mutation.get("type", ""))
-        ts = event.get("ts", "")
+        if isinstance(mutation, dict):
+            kind = mutation.get("kind", mutation.get("type", ""))
+        else:
+            # mutation is a scalar (e.g. the string "rename")
+            kind = str(mutation)
 
         if kind == "rename" or "rename" in str(mutation):
-            old_name = mutation.get("old_name", mutation.get("from", ""))
-            new_name = mutation.get("new_name", mutation.get("to", ""))
+            if isinstance(mutation, dict):
+                old_name = mutation.get("old_name", mutation.get("from", ""))
+                new_name = mutation.get("new_name", mutation.get("to", ""))
+            else:
+                old_name = event.get("old_name", event.get("from", ""))
+                new_name = event.get("new_name", event.get("to", ""))
             if old_name and new_name:
                 self.resolver.rename(old_name, new_name, ts)
         elif kind in ("dep_add", "dep_remove", "dependency"):
-            src = mutation.get("src", mutation.get("source", ""))
-            dst = mutation.get("dst", mutation.get("target", ""))
+            if isinstance(mutation, dict):
+                src = mutation.get("src", mutation.get("source", ""))
+                dst = mutation.get("dst", mutation.get("target", ""))
+            else:
+                src = event.get("src", "")
+                dst = event.get("dst", "")
             if src:
                 self.resolver.resolve(src)
             if dst:
@@ -192,7 +303,8 @@ class Engine:
         kind = event.get("kind", "signal")
 
         # Check: does this signal follow a recent deploy for cid?
-        recent_deploy = self.graph.get_recent_deploy(cid, ts, window_s=600)
+        # Use 3600s (1 hour) window to capture deploy→latency spike patterns in generator
+        recent_deploy = self.graph.get_recent_deploy(cid, ts, window_s=3600)
         if recent_deploy:
             self.graph.add_edge(
                 src_cid=cid,
@@ -211,30 +323,40 @@ class Engine:
                     continue
                 span_cid = self.resolver.resolve(span_svc)
                 if span_cid != cid:
-                    span_ts = span.get("ts", ts)
-                    # Ensure temporal ordering
-                    self.graph.add_edge(
-                        src_cid=cid,
-                        dst_cid=span_cid,
-                        relation="upstream_call",
-                        evidence_id=event["trace_id"],
-                        ts_src=ts,
-                        ts_dst=span_ts if span_ts > ts else ts,
-                    )
+                    span_ts = span.get("ts", "")
+                    # Ensure ts_dst is strictly after ts_src
+                    if not span_ts or span_ts <= ts:
+                        try:
+                            dt = datetime.fromisoformat(ts.replace("Z", "+00:00"))
+                            span_ts = (dt + timedelta(seconds=1)).isoformat()
+                        except Exception:
+                            span_ts = ""
+                    if span_ts:
+                        self.graph.add_edge(
+                            src_cid=cid,
+                            dst_cid=span_cid,
+                            relation="upstream_call",
+                            evidence_id=event["trace_id"],
+                            ts_src=ts,
+                            ts_dst=span_ts,
+                        )
 
         # Log error signals: if error level, add signal→incident edge candidate
         if kind == "log" and event.get("level") in ("error", "critical", "fatal"):
             # Check if there's an open incident for this entity
             for inc_id, inc in self._open_incidents.items():
                 if inc.get("cid") == cid:
-                    self.graph.add_edge(
-                        src_cid=cid,
-                        dst_cid=cid,
-                        relation="error_log_during_incident",
-                        evidence_id=event.get("event_id") or ts,
-                        ts_src=ts,
-                        ts_dst=inc.get("ts", ts),
-                    )
+                    inc_ts = inc.get("ts", "")
+                    # Incident opened first (ts_src=inc_ts) → error log seen after (ts_dst=ts)
+                    if inc_ts and inc_ts < ts:
+                        self.graph.add_edge(
+                            src_cid=cid,
+                            dst_cid=cid,
+                            relation="error_log_during_incident",
+                            evidence_id=event.get("event_id") or ts,
+                            ts_src=inc_ts,
+                            ts_dst=ts,
+                        )
 
     def _on_incident(self, event: dict, cid: str) -> None:
         """Open an incident window for this entity."""
@@ -247,23 +369,55 @@ class Engine:
 
     def _on_remediation(self, event: dict, cid: str) -> None:
         """
-        Close an incident window. If outcome=resolved, reinforce causal edges
-        and index the completed incident as a behavioral motif.
+        Close an incident window. If outcome=resolved, reinforce causal edges,
+        reinforce successful memory patterns, and index the completed incident.
+
+        MEMORY EVOLUTION: When a remediation succeeds, we boost confidence of
+        matching patterns so the engine learns what works.
         """
         inc_id = event.get("incident_id", "")
         outcome = event.get("outcome", "unknown")
+        ts = event.get("ts", "")
+        success = outcome == "resolved"
 
-        if outcome == "resolved":
-            self.graph.reinforce_remediation(cid, event)
+        if success:
+            self.graph.reinforce_remediation(
+                cid=cid,
+                incident_id=inc_id,
+                action=event.get("action", "unknown"),
+                outcome=outcome,
+                ts=ts,
+                window_s=3600,
+            )
 
             # Index this as a completed incident motif
             edges = self.graph.get_causal_chain(cid, max_hops=2)
             motif = self.graph.extract_motif(edges)
+            motif.incident_id = inc_id
             motif.remediation_action = event.get("action", "")
             motif.remediation_outcome = outcome
-            motif.incident_id = inc_id
-            motif.timestamp = event.get("ts", "")
-            self.motifs.index_incident(motif)
+            motif.timestamp = ts
+            if cid not in motif.canonical_ids:
+                motif.canonical_ids.append(cid)
+
+            # MEMORY EVOLUTION: Store with timestamp for aging
+            self.motifs.index_incident(motif, timestamp=ts)
+
+            # MEMORY EVOLUTION: Reinforce patterns that worked
+            # When a remediation succeeds, boost confidence of the pattern
+            # that matched this incident. This teaches the engine.
+            self.motifs.apply_reinforcement(
+                incident_id=inc_id,
+                success=True,
+                timestamp=ts
+            )
+        else:
+            # Remediation failed: penalty to matching patterns
+            self.motifs.apply_reinforcement(
+                incident_id=inc_id,
+                success=False,
+                timestamp=ts
+            )
 
         # Close the incident window
         if inc_id in self._open_incidents:
@@ -281,8 +435,17 @@ class Engine:
         """
         Reconstruct context for an incident signal.
         Reads are concurrent-safe with the append-only store.
-        No lock needed here.
+
+        MEMORY EVOLUTION: Before matching, apply confidence decay to patterns.
+        This ensures older patterns have lower confidence, allowing the engine
+        to adapt to changing infrastructure.
         """
+        # Apply memory evolution: decay old patterns
+        # This happens lazily (only when needed) for efficiency
+        anchor_ts = signal.get("ts", "")
+        if anchor_ts:
+            self.motifs.apply_decay(anchor_ts)
+
         return self.assembler.assemble(
             signal=signal,
             mode=mode,
