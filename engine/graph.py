@@ -93,7 +93,6 @@ class OperationalGraph:
 
         # TEMPORAL ENFORCEMENT
         if not _is_before(ts_src, ts_dst):
-            print(f"WARNING: Temporal violation - {ts_src} >= {ts_dst}. Skipping edge.")
             return
 
         with self._lock:
@@ -360,18 +359,16 @@ class OperationalGraph:
                 return None
 
             window_start = _subtract_seconds(before_ts, window_s)
-            candidates = []
-            for d in deploys:
+            # Deploys are append-only in time order — scan from most recent.
+            for d in reversed(deploys):
                 dts = d.get("ts", "")
                 if not dts:
                     continue
                 if (_is_before(window_start, dts) or dts == window_start) and (
                     _is_before(dts, before_ts) or dts == before_ts
                 ):
-                    candidates.append(d)
-            if not candidates:
-                return None
-            return max(candidates, key=lambda d: d.get("ts", ""))
+                    return d
+            return None
 
     # ------------------------------------------------------------------
     # Motif extraction

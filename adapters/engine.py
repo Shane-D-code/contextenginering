@@ -102,28 +102,29 @@ class Engine:
             for event in topology_events:
                 self._on_topology(event)
 
-            # Resolve all canonical_ids and prepare batch insert rows
+            # Resolve canonical_ids once; buffer store writes; update graph
             batch_rows: list[tuple] = []
+            graph_work: list[tuple[dict, str, str]] = []
             for event in other_events:
                 cid = self._resolve_cid_for_event(event)
                 if not cid:
                     continue
-                event_id = event.get("event_id") or event.get("id") or str(uuid.uuid4())
-                ts = event.get("ts", "")
                 kind = event.get("kind", "unknown")
-                trace_id = event.get("trace_id")
-                batch_rows.append((event_id, cid, ts, kind, trace_id, event))
+                event_id = event.get("event_id") or event.get("id") or str(uuid.uuid4())
+                batch_rows.append((
+                    event_id,
+                    cid,
+                    event.get("ts", ""),
+                    kind,
+                    event.get("trace_id"),
+                    event,
+                ))
+                graph_work.append((event, cid, kind))
 
-            # Batch insert all events at once
             if batch_rows:
                 self.store.append_batch(batch_rows)
 
-            # Process graph/motif updates (non-storage logic)
-            for event in other_events:
-                kind = event.get("kind", "")
-                cid = self._resolve_cid_for_event(event)
-                if not cid:
-                    continue
+            for event, cid, kind in graph_work:
                 if kind == "deploy":
                     self._on_deploy(event, cid)
                 elif kind in ("log", "metric", "trace"):

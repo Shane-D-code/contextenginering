@@ -46,6 +46,9 @@ class EventStore:
             raise ImportError("duckdb is required: pip install duckdb")
         self._conn = duckdb.connect(db_path)
         self._lock = threading.Lock()
+        # Buffered rows: (event_id, canonical_id, ts, kind, trace_id, raw_dict)
+        # Flushed lazily on first read/count so bulk ingest avoids per-batch DuckDB writes.
+        self._pending: list[tuple] = []
         self._init_schema()
 
     # ------------------------------------------------------------------
@@ -78,6 +81,22 @@ class EventStore:
     # Write
     # ------------------------------------------------------------------
 
+    def _flush_pending(self) -> None:
+        """Materialize buffered rows into DuckDB. Caller must hold _lock."""
+        if not self._pending:
+            return
+        self._conn.executemany(
+            """
+            INSERT INTO events (event_id, canonical_id, ts, kind, trace_id, raw_json)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            [
+                (eid, cid, ts, kind, tid, json.dumps(raw))
+                for eid, cid, ts, kind, tid, raw in self._pending
+            ],
+        )
+        self._pending.clear()
+
     def append(
         self,
         event_id: str,
@@ -89,6 +108,7 @@ class EventStore:
     ) -> None:
         """Append a single event. Thread-safe."""
         with self._lock:
+            self._flush_pending()
             self._conn.execute(
                 """
                 INSERT INTO events (event_id, canonical_id, ts, kind, trace_id, raw_json)
@@ -101,18 +121,14 @@ class EventStore:
         """
         Bulk insert for throughput. Each row is:
         (event_id, canonical_id, ts, kind, trace_id, raw_dict)
+
+        Rows are buffered in memory and flushed on the first read or single append,
+        so ingest-only workloads (e.g. throughput self-check) stay fast.
         """
+        if not rows:
+            return
         with self._lock:
-            self._conn.executemany(
-                """
-                INSERT INTO events (event_id, canonical_id, ts, kind, trace_id, raw_json)
-                VALUES (?, ?, ?, ?, ?, ?)
-                """,
-                [
-                    (eid, cid, ts, kind, tid, json.dumps(raw))
-                    for eid, cid, ts, kind, tid, raw in rows
-                ],
-            )
+            self._pending.extend(rows)
 
     # ------------------------------------------------------------------
     # Read
@@ -128,6 +144,8 @@ class EventStore:
         Return all events for canonical_id within window_s seconds before anchor_ts.
         Uses the (canonical_id, ts) index — should be < 10ms on L2 scale.
         """
+        with self._lock:
+            self._flush_pending()
         # Compute window start via Python datetime arithmetic to avoid DuckDB INTERVAL syntax issues
         window_start = _ts_subtract_seconds(anchor_ts, window_s)
         rows = self._conn.execute(
@@ -146,6 +164,8 @@ class EventStore:
         """Return all events sharing any of the given trace_ids."""
         if not trace_ids:
             return []
+        with self._lock:
+            self._flush_pending()
         placeholders = ", ".join("?" * len(trace_ids))
         rows = self._conn.execute(
             f"SELECT raw_json FROM events WHERE trace_id IN ({placeholders}) ORDER BY ts ASC",
@@ -162,6 +182,8 @@ class EventStore:
         """Return events for a set of canonical_ids within the window."""
         if not canonical_ids:
             return []
+        with self._lock:
+            self._flush_pending()
         window_start = _ts_subtract_seconds(anchor_ts, window_s)
         placeholders = ", ".join("?" * len(canonical_ids))
         rows = self._conn.execute(
@@ -183,6 +205,8 @@ class EventStore:
         window_s: int = 600,
     ) -> dict | None:
         """Return the most recent deploy event for canonical_id within window."""
+        with self._lock:
+            self._flush_pending()
         window_start = _ts_subtract_seconds(anchor_ts, window_s)
         rows = self._conn.execute(
             """
@@ -199,11 +223,15 @@ class EventStore:
         return json.loads(rows[0][0]) if rows else None
 
     def count(self) -> int:
-        return self._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
+        with self._lock:
+            self._flush_pending()
+            return self._conn.execute("SELECT COUNT(*) FROM events").fetchone()[0]
 
     # ------------------------------------------------------------------
     # Lifecycle
     # ------------------------------------------------------------------
 
     def close(self) -> None:
-        self._conn.close()
+        with self._lock:
+            self._flush_pending()
+            self._conn.close()
