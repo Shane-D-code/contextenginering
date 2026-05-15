@@ -14,6 +14,8 @@ import importlib
 import sys
 import time
 
+import _paths  # noqa: F401  — repo root + bench dir on sys.path
+
 from generator import GenConfig
 from harness import run
 

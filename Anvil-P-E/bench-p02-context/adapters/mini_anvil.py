@@ -20,8 +20,9 @@ for _p in (_REPO, _BENCH):
         sys.path.insert(0, _p)
 
 from adapter import Adapter  # noqa: E402
-from adapters.engine import Engine as _RootEngine  # noqa: E402
+
+from adapters.engine import _load_root_engine_class  # noqa: E402
 
 
-class Engine(_RootEngine, Adapter):
+class Engine(_load_root_engine_class(), Adapter):
     """Delegates ingest / reconstruct_context / close to the root engine."""

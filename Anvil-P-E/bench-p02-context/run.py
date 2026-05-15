@@ -12,6 +12,8 @@ import importlib
 import json
 import sys
 
+import _paths  # noqa: F401  — repo root + bench dir on sys.path
+
 from generator import GenConfig
 from harness import run
 
