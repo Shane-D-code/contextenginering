@@ -20,7 +20,7 @@ from typing import Iterable, Literal
 from engine.assembler import ContextAssembler
 from engine.graph import OperationalGraph
 from engine.identity import IdentityResolver
-from engine.motifs import BehavioralMotifIndex
+from engine.motifs import BehavioralMotifIndex, sequence_from_events
 from engine.store import EventStore
 
 
@@ -391,7 +391,7 @@ class Engine:
                 window_s=3600,
             )
 
-            # Index this as a completed incident motif
+            # Index this as a completed incident motif (enriched from event store)
             edges = self.graph.get_causal_chain(cid, max_hops=2)
             motif = self.graph.extract_motif(edges)
             motif.incident_id = inc_id
@@ -399,8 +399,17 @@ class Engine:
             motif.remediation_action = event.get("action", "")
             motif.remediation_outcome = outcome
             motif.timestamp = ts
-            if cid not in motif.canonical_ids:
-                motif.canonical_ids.append(cid)
+            window_events = self.store.get_window(cid, ts, window_s=3600)
+            seq = sequence_from_events(window_events)
+            if seq:
+                motif.event_sequence = seq
+            motif_cids = set(motif.canonical_ids)
+            motif_cids.add(cid)
+            for ev in window_events:
+                svc = ev.get("service") or ev.get("target") or ev.get("svc")
+                if svc:
+                    motif_cids.add(self.resolver.resolve(svc))
+            motif.canonical_ids = list(motif_cids)
 
             # MEMORY EVOLUTION: Store with timestamp for aging
             self.motifs.index_incident(motif, timestamp=ts)

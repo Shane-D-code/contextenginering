@@ -30,6 +30,7 @@ class IncidentMatch:
     remediation_outcome: str
     timestamp: str
     canonical_ids: list[str]
+    primary_cid: str = ""
     pattern_confidence: float = 1.0  # NEW: evolved confidence of the pattern
 
 
@@ -94,6 +95,9 @@ class BehavioralMotifIndex:
                         self._motifs[i].motif = motif
                         self._motifs[i].created_at = timestamp
                         return
+
+            if not motif.primary_cid and motif.canonical_ids:
+                motif.primary_cid = motif.canonical_ids[0]
 
             # NEW: Wrap motif with evolution metadata
             stored = StoredMotif(
@@ -230,7 +234,11 @@ class BehavioralMotifIndex:
             if not self._motifs:
                 return []
 
-            primary = query_primary_cid or getattr(query_motif, "primary_cid", "") or ""
+            primary = (
+                query_primary_cid
+                or getattr(query_motif, "primary_cid", "")
+                or (query_motif.canonical_ids[0] if query_motif.canonical_ids else "")
+            )
 
             scored: list[tuple[float, StoredMotif, str, float]] = []
             for stored in self._motifs:
@@ -253,19 +261,25 @@ class BehavioralMotifIndex:
 
             filtered = [s for s in top if s[0] > 0.01 and s[0] >= min_similarity]
 
-            return [
-                IncidentMatch(
-                    incident_id=m.motif.incident_id,
-                    similarity=round(min(1.0, score), 3),
-                    rationale=rationale,
-                    remediation_action=m.motif.remediation_action,
-                    remediation_outcome=m.motif.remediation_outcome,
-                    timestamp=m.motif.timestamp,
-                    canonical_ids=list(m.motif.canonical_ids),
-                    pattern_confidence=round(pattern_conf, 3),  # NEW: Show evolved confidence
+            out: list[IncidentMatch] = []
+            for score, m, rationale, pattern_conf in filtered:
+                sp = getattr(m.motif, "primary_cid", "") or (
+                    m.motif.canonical_ids[0] if m.motif.canonical_ids else ""
                 )
-                for score, m, rationale, pattern_conf in filtered
-            ]
+                out.append(
+                    IncidentMatch(
+                        incident_id=m.motif.incident_id,
+                        similarity=round(min(1.0, score), 3),
+                        rationale=rationale,
+                        remediation_action=m.motif.remediation_action,
+                        remediation_outcome=m.motif.remediation_outcome,
+                        timestamp=m.motif.timestamp,
+                        canonical_ids=list(m.motif.canonical_ids),
+                        primary_cid=sp,
+                        pattern_confidence=round(pattern_conf, 3),
+                    )
+                )
+            return out
 
     def count(self) -> int:
         return len(self._motifs)
@@ -325,7 +339,52 @@ class BehavioralMotifIndex:
 
 
 # ------------------------------------------------------------------
-# Similarity computation (unchanged, but now used with confidence weighting)
+# Motif sequence helpers
+# ------------------------------------------------------------------
+
+def sequence_from_events(events: list[dict]) -> list[str]:
+    """Build ordered motif tokens from raw telemetry (rename-proof)."""
+    ordered = sorted(events, key=lambda e: e.get("ts", ""))
+    seq: list[str] = []
+    for ev in ordered:
+        kind = ev.get("kind", "")
+        if kind not in ("deploy", "metric", "log", "trace", "incident_signal", "remediation"):
+            continue
+        token = _event_kind_token(kind, ev)
+        if not seq or seq[-1] != token:
+            seq.append(token)
+    return seq
+
+
+def _event_kind_token(kind: str, event: dict) -> str:
+    if kind == "deploy":
+        return "DEPLOY"
+    if kind == "metric":
+        name = str(event.get("name") or event.get("metric") or "").lower()
+        if "latency" in name or "p99" in name:
+            return "METRIC_LATENCY"
+        return "METRIC"
+    if kind == "log":
+        msg = str(event.get("message") or event.get("msg") or "").lower()
+        if "timeout" in msg:
+            return "LOG_TIMEOUT"
+        if event.get("level") in ("error", "critical", "fatal"):
+            return "LOG_ERROR"
+        return "LOG"
+    if kind == "trace":
+        return "TRACE"
+    if kind == "incident_signal":
+        return "SIGNAL"
+    if kind == "remediation":
+        action = str(event.get("action", "")).lower()
+        if action == "rollback":
+            return "REMEDIATION_ROLLBACK"
+        return "REMEDIATION"
+    return kind.upper()
+
+
+# ------------------------------------------------------------------
+# Similarity computation
 # ------------------------------------------------------------------
 
 def _jaccard(a: list | set, b: list | set) -> float:
@@ -353,8 +412,6 @@ def _compute_similarity(
     """
     qp = (query_primary or getattr(query, "primary_cid", "") or "").strip()
     sp = (getattr(stored, "primary_cid", "") or "").strip()
-    if not sp and stored.canonical_ids:
-        sp = stored.canonical_ids[0]
 
     q_cids = set(query.canonical_ids)
     s_cids = set(stored.canonical_ids)
@@ -370,6 +427,14 @@ def _compute_similarity(
         shape_sim = _jaccard(q_edges, s_edges)
         score = min(0.32, 0.12 * seq_sim + 0.10 * shape_sim + 0.10 * cid_sim)
         return score, f"different primary service ({qp} vs {sp})"
+
+    if q_cids and s_cids and not (q_cids & s_cids):
+        seq_sim = _jaccard(query.event_sequence, stored.event_sequence)
+        q_edges = set(tuple(x) for x in query.causal_shape)
+        s_edges = set(tuple(x) for x in stored.causal_shape)
+        shape_sim = _jaccard(q_edges, s_edges)
+        score = min(0.28, 0.10 * seq_sim + 0.08 * shape_sim)
+        return score, "no shared canonical service"
 
     if qp and sp and qp == sp:
         primary_sim = 1.0
@@ -399,15 +464,19 @@ def _compute_similarity(
     # 4. Sequence order similarity bonus — penalize if order is very different
     order_bonus = _sequence_order_similarity(query.event_sequence, stored.event_sequence)
 
-    score = min(
-        1.0,
-        0.55 * primary_sim
+    structural = (
+        0.20 * shape_sim
+        + 0.25 * seq_sim
+        + 0.10 * action_match
+        + 0.05 * order_bonus
         + 0.10 * cid_sim
-        + 0.20 * shape_sim
-        + 0.10 * seq_sim
-        + 0.05 * action_match
-        + 0.05 * order_bonus,
     )
+    if qp and sp and qp == sp:
+        score = min(1.0, 0.78 + 0.22 * structural)
+    else:
+        score = min(1.0, 0.55 * primary_sim + structural)
+        if cid_sim < 0.67 and not (qp and sp):
+            score = min(score, 0.40 + 0.45 * cid_sim)
     if (
         seq_sim >= 1.0
         and shape_sim >= 1.0

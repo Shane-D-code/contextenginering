@@ -19,7 +19,7 @@ from typing import Any, Literal
 
 from engine.graph import CausalEdge, IncidentMotif, OperationalGraph
 from engine.identity import IdentityResolver
-from engine.motifs import BehavioralMotifIndex, IncidentMatch
+from engine.motifs import BehavioralMotifIndex, IncidentMatch, sequence_from_events
 from engine.store import EventStore
 
 
@@ -100,8 +100,11 @@ class ContextAssembler:
             if svc:
                 motif_cids.add(resolver.resolve(svc))
         current_motif.canonical_ids = list(motif_cids)
+        seq = sequence_from_events(related)
+        if seq:
+            current_motif.event_sequence = seq
         matches = motif_index.find_similar(
-            current_motif, top_k=10, query_primary_cid=cid
+            current_motif, top_k=20, query_primary_cid=cid
         )
         matches = _filter_similar_matches(matches, primary_cid=cid)[:5]
 
@@ -198,9 +201,12 @@ def _filter_similar_matches(
         return matches
 
     def _has_primary(m: IncidentMatch) -> bool:
-        return bool(primary_cid and primary_cid in (m.canonical_ids or []))
+        if not primary_cid:
+            return False
+        if m.primary_cid and m.primary_cid == primary_cid:
+            return True
+        return primary_cid in (m.canonical_ids or [])
 
-    high = [m for m in matches if m.similarity >= threshold]
     if primary_cid:
         primary_first = sorted(
             [m for m in matches if _has_primary(m)],
@@ -209,18 +215,10 @@ def _filter_similar_matches(
         )
         if not primary_first:
             return []
-        seen: set[str] = set()
-        out: list[IncidentMatch] = []
-        for bucket in (primary_first, high, matches):
-            for m in bucket:
-                if m.incident_id in seen:
-                    continue
-                seen.add(m.incident_id)
-                out.append(m)
-                if len(out) >= 5:
-                    return out
-        return out
+        # Only same-primary service — never pad with cross-family false positives.
+        return primary_first[:5]
 
+    high = [m for m in matches if m.similarity >= threshold]
     if len(high) >= min_count:
         return high[:5]
     return matches[:5]
