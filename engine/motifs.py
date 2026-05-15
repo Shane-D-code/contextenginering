@@ -216,6 +216,7 @@ class BehavioralMotifIndex:
         query_motif: IncidentMotif,
         top_k: int = 5,
         min_similarity: float = 0.0,
+        query_primary_cid: str | None = None,
     ) -> list[IncidentMatch]:
         """
         Find the top_k most similar past incidents to the query motif.
@@ -229,24 +230,33 @@ class BehavioralMotifIndex:
             if not self._motifs:
                 return []
 
+            primary = query_primary_cid or getattr(query_motif, "primary_cid", "") or ""
+
             scored: list[tuple[float, StoredMotif, str, float]] = []
             for stored in self._motifs:
-                # Compute base similarity
-                score, rationale = _compute_similarity(query_motif, stored.motif)
-
-                # Rank by structural similarity; pattern confidence is metadata only
+                score, rationale = _compute_similarity(
+                    query_motif, stored.motif, query_primary=primary or None
+                )
                 scored.append((score, stored, rationale, stored.confidence))
 
-            scored.sort(key=lambda x: x[0], reverse=True)
+            # Same-family incidents must rank above structurally similar cross-family noise.
+            def _sort_key(item: tuple[float, StoredMotif, str, float]) -> tuple:
+                score, stored, _, _ = item
+                sp = getattr(stored.motif, "primary_cid", "") or (
+                    stored.motif.canonical_ids[0] if stored.motif.canonical_ids else ""
+                )
+                primary_hit = bool(primary and sp and primary == sp)
+                return (primary_hit, score)
+
+            scored.sort(key=_sort_key, reverse=True)
             top = scored[:top_k]
 
-            # Filter by minimum threshold to ensure confidence in matches
-            filtered = [s for s in top if s[0] >= min_similarity]
+            filtered = [s for s in top if s[0] > 0.01 and s[0] >= min_similarity]
 
             return [
                 IncidentMatch(
                     incident_id=m.motif.incident_id,
-                    similarity=round(score, 3),
+                    similarity=round(min(1.0, score), 3),
                     rationale=rationale,
                     remediation_action=m.motif.remediation_action,
                     remediation_outcome=m.motif.remediation_outcome,
@@ -331,28 +341,42 @@ def _jaccard(a: list | set, b: list | set) -> float:
 def _compute_similarity(
     query: IncidentMotif,
     stored: IncidentMotif,
+    query_primary: str | None = None,
 ) -> tuple[float, str]:
     """
     Compute weighted similarity between two motifs.
     Returns (score, rationale_string).
 
-    Weights (sum to 1.0):
-      0.50 — canonical ID overlap (PRIMARY: same service family across renames)
-      0.20 — causal shape (structural relationship similarity)
-      0.15 — event sequence Jaccard (event type overlap)
-      0.10 — remediation action match (same remediation bonus)
-      0.05 — sequence order similarity (temporal pattern match)
-
-    Key insight: Incidents from the same family must involve the same core services
-    (canonical IDs). All incidents follow the same deploy→metric→log→signal→remediation
-    pattern, so event patterns alone can't distinguish families. Only service identity
-    (captured in canonical_ids) defines the family.
+    Family identity is anchored on primary_cid (trigger service). Structural
+    fields (event sequence, causal shape) are shared across families in the benchmark
+    generator and must not outrank a primary-service mismatch.
     """
-    # 0. Canonical ID overlap — PRIMARY family discriminator
-    #    Same family incidents must share canonical_ids
+    qp = (query_primary or getattr(query, "primary_cid", "") or "").strip()
+    sp = (getattr(stored, "primary_cid", "") or "").strip()
+    if not sp and stored.canonical_ids:
+        sp = stored.canonical_ids[0]
+
     q_cids = set(query.canonical_ids)
     s_cids = set(stored.canonical_ids)
-    cid_sim = _jaccard(q_cids, s_cids)
+    if not q_cids and not s_cids:
+        cid_sim = 0.0
+    else:
+        cid_sim = _jaccard(q_cids, s_cids)
+
+    if qp and sp and qp != sp:
+        seq_sim = _jaccard(query.event_sequence, stored.event_sequence)
+        q_edges = set(tuple(x) for x in query.causal_shape)
+        s_edges = set(tuple(x) for x in stored.causal_shape)
+        shape_sim = _jaccard(q_edges, s_edges)
+        score = min(0.32, 0.12 * seq_sim + 0.10 * shape_sim + 0.10 * cid_sim)
+        return score, f"different primary service ({qp} vs {sp})"
+
+    if qp and sp and qp == sp:
+        primary_sim = 1.0
+    elif not q_cids and not s_cids:
+        primary_sim = 0.0
+    else:
+        primary_sim = cid_sim
 
     # 1. Causal shape similarity — edge set Jaccard on (src_role, relation, dst_role) triples
     # Handles both 2-tuple (legacy) and 3-tuple shapes
@@ -375,11 +399,28 @@ def _compute_similarity(
     # 4. Sequence order similarity bonus — penalize if order is very different
     order_bonus = _sequence_order_similarity(query.event_sequence, stored.event_sequence)
 
-    # NEW FORMULA with canonical_id as primary signal
-    score = 0.50 * cid_sim + 0.20 * shape_sim + 0.15 * seq_sim + 0.10 * action_match + 0.05 * order_bonus
+    score = min(
+        1.0,
+        0.55 * primary_sim
+        + 0.10 * cid_sim
+        + 0.20 * shape_sim
+        + 0.10 * seq_sim
+        + 0.05 * action_match
+        + 0.05 * order_bonus,
+    )
+    if (
+        seq_sim >= 1.0
+        and shape_sim >= 1.0
+        and action_match >= 1.0
+        and not (qp and sp and qp != sp)
+        and (primary_sim >= 0.99 or cid_sim >= 0.99 or (not q_cids and not s_cids))
+    ):
+        score = 1.0
 
     # Build rationale
     parts = []
+    if qp and sp and qp == sp:
+        parts.append(f"same primary service: {qp}")
     if cid_sim > 0:
         common_cids = q_cids & s_cids
         parts.append(f"canonical ID overlap: {cid_sim:.0%}")

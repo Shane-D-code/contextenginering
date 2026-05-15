@@ -71,6 +71,7 @@ class IncidentMotif:
     """
 
     incident_id: str = ""
+    primary_cid: str = ""  # family anchor service (trigger / remediation entity)
     canonical_ids: List[str] = field(default_factory=list)  # provenance only
     event_sequence: List[str] = field(default_factory=list)
     causal_shape: List[tuple] = field(default_factory=list)

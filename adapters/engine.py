@@ -395,6 +395,7 @@ class Engine:
             edges = self.graph.get_causal_chain(cid, max_hops=2)
             motif = self.graph.extract_motif(edges)
             motif.incident_id = inc_id
+            motif.primary_cid = cid
             motif.remediation_action = event.get("action", "")
             motif.remediation_outcome = outcome
             motif.timestamp = ts

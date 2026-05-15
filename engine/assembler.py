@@ -92,12 +92,18 @@ class ContextAssembler:
         # 5. Similar incidents — from motif index
         current_motif = graph.extract_motif(edges)
         current_motif.timestamp = anchor_ts
-        # Anchor the query motif to the target service's canonical_id
-        # This is the primary family discriminator across renames
-        if cid not in current_motif.canonical_ids:
-            current_motif.canonical_ids.append(cid)
-        matches = motif_index.find_similar(current_motif, top_k=10)
-        matches = _filter_similar_matches(matches)[:5]
+        current_motif.primary_cid = cid
+        motif_cids = set(current_motif.canonical_ids)
+        motif_cids.add(cid)
+        for ev in related:
+            svc = ev.get("service") or ev.get("target") or ev.get("svc")
+            if svc:
+                motif_cids.add(resolver.resolve(svc))
+        current_motif.canonical_ids = list(motif_cids)
+        matches = motif_index.find_similar(
+            current_motif, top_k=10, query_primary_cid=cid
+        )
+        matches = _filter_similar_matches(matches, primary_cid=cid)[:5]
 
         # 6. Suggested remediations
         remediations = _build_remediations(matches, graph, cid, resolver)
@@ -184,15 +190,40 @@ class ContextAssembler:
 def _filter_similar_matches(
     matches: list[IncidentMatch],
     threshold: float = 0.45,
-    min_count: int = 3,
+    min_count: int = 2,
+    primary_cid: str | None = None,
 ) -> list[IncidentMatch]:
-    """Post-retrieval confidence filter; fallback preserves recall when too few pass."""
+    """Keep high-confidence matches; prefer same primary service for precision@5."""
     if not matches:
         return matches
-    filtered = [m for m in matches if m.similarity >= threshold]
-    if len(filtered) < min_count:
-        return matches
-    return filtered
+
+    def _has_primary(m: IncidentMatch) -> bool:
+        return bool(primary_cid and primary_cid in (m.canonical_ids or []))
+
+    high = [m for m in matches if m.similarity >= threshold]
+    if primary_cid:
+        primary_first = sorted(
+            [m for m in matches if _has_primary(m)],
+            key=lambda m: m.similarity,
+            reverse=True,
+        )
+        if not primary_first:
+            return []
+        seen: set[str] = set()
+        out: list[IncidentMatch] = []
+        for bucket in (primary_first, high, matches):
+            for m in bucket:
+                if m.incident_id in seen:
+                    continue
+                seen.add(m.incident_id)
+                out.append(m)
+                if len(out) >= 5:
+                    return out
+        return out
+
+    if len(high) >= min_count:
+        return high[:5]
+    return matches[:5]
 
 
 def _dedupe(events: list[dict]) -> list[dict]:
